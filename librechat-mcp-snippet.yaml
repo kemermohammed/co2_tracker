@@ -1,0 +1,11 @@
+# Add this block to your existing librechat.yaml gist, alongside
+# the "endpoints" block you already have. Replace the URL with your
+# actual Railway internal/public address for the co2-mcp-server service.
+
+mcpServers:
+  co2Tracker:
+    type: streamable-http
+    url: "https://co2-mcp-server.up.railway.app/mcp"
+    # If you deploy this in the SAME Railway project as LibreChat,
+    # you can instead use the private internal URL for lower latency:
+    # url: "http://co2-mcp-server.railway.internal:3000/mcp"
