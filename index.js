@@ -3,22 +3,23 @@ const { MongoClient } = require("mongodb");
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
+const SCALEWAY_API_KEY = process.env.SCALEWAY_API_KEY;
+const SCALEWAY_PROJECT_ID = process.env.SCALEWAY_PROJECT_ID;
 
-// --- CO2 calculation constants ---
-// Grid carbon intensity for Scaleway PAR-2 (Paris), published by Scaleway.
+
 const GRID_INTENSITY_KG_PER_KWH = 0.065;
 
 // Energy-per-token estimates (Wh/token) by rough model size class.
-// These are research estimates, not measured Scaleway figures.
+// These are research estimates, used as fallback if Scaleway API unavailable.
 function energyPerToken(model) {
   const m = (model || "").toLowerCase();
   if (m.includes("235b") || m.includes("397b") || m.includes("medium")) {
-    return 0.0006; // very large models
+    return 0.0006; 
   }
   if (m.includes("30b") || m.includes("12b") || m.includes("8b")) {
-    return 0.00015; // small/mid models
+    return 0.00015; 
   }
-  return 0.0003; // default: ~70-120b class
+  return 0.0003; 
 }
 
 function co2FromTokens(totalTokens, model) {
@@ -29,7 +30,74 @@ function co2FromTokens(totalTokens, model) {
     totalTokens,
     energyWh: Number(wh.toFixed(4)),
     co2Grams: Number((co2Kg * 1000).toFixed(4)),
+    source: "estimate", // Mark as estimate
   };
+}
+
+
+// Fetch actual measured CO2 from Scaleway's Environmental Footprint API
+async function getScalewayActualCO2(conversationStartTime, conversationEndTime) {
+  if (!SCALEWAY_API_KEY || !SCALEWAY_PROJECT_ID) {
+    console.log(
+      "⚠️  Scaleway API credentials not configured, will use estimates"
+    );
+    return null;
+  }
+
+  try {
+    // Scaleway Environmental Footprint API endpoint (v1 API)
+    // This fetches carbon emissions data for a given time range and project
+    const url = new URL(
+      `https://api.scaleway.com/environmental-footprint/v1/carbon-emissions`
+    );
+
+    url.searchParams.append("project_id", SCALEWAY_PROJECT_ID);
+    url.searchParams.append("start_date", conversationStartTime);
+    url.searchParams.append("end_date", conversationEndTime);
+    url.searchParams.append("group_by", "day"); // Group by day for accuracy
+
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "X-Auth-Token": SCALEWAY_API_KEY,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      console.log(
+        `⚠️  Scaleway API returned ${response.status}, falling back to estimates`
+      );
+      return null;
+    }
+
+    const data = await response.json();
+
+    // Sum CO2 from all services (especially Generative APIs)
+    let totalCO2Grams = 0;
+    if (data.carbon_emissions && Array.isArray(data.carbon_emissions)) {
+      for (const emission of data.carbon_emissions) {
+        // CO2 is typically in kg, convert to grams
+        if (emission.co2_kg) {
+          totalCO2Grams += emission.co2_kg * 1000;
+        }
+      }
+    }
+
+    if (totalCO2Grams > 0) {
+      return {
+        co2Grams: Number(totalCO2Grams.toFixed(4)),
+        source: "scaleway_api", // Mark as from Scaleway
+      };
+    }
+
+    return null;
+  } catch (err) {
+    console.log(
+      `⚠️  Scaleway API error (${err.message}), falling back to estimates`
+    );
+    return null;
+  }
 }
 
 let db;
@@ -73,11 +141,22 @@ async function getConversationTokens(conversationId) {
     { sort: { createdAt: -1 } }
   );
 
+  // Get conversation start and end times for API query
+  const firstMsg = await messages.findOne({ conversationId });
+  const conversationStart = firstMsg
+    ? new Date(firstMsg.createdAt).toISOString().split("T")[0]
+    : new Date().toISOString().split("T")[0];
+  const conversationEnd = lastMsg
+    ? new Date(lastMsg.createdAt).toISOString().split("T")[0]
+    : new Date().toISOString().split("T")[0];
+
   return {
     promptTokens,
     completionTokens,
     totalTokens: promptTokens + completionTokens,
     model: lastMsg ? lastMsg.model : null,
+    startTime: conversationStart,
+    endTime: conversationEnd,
   };
 }
 
@@ -89,7 +168,7 @@ const TOOLS = [
   {
     name: "get_conversation_co2",
     description:
-      "Get the real token usage and estimated CO2 emissions for a specific LibreChat conversation, using actual recorded token transactions.",
+      "Get the real token usage and CO2 emissions for a specific LibreChat conversation. Uses actual Scaleway Environmental Footprint API if configured, otherwise estimates based on token count.",
     inputSchema: {
       type: "object",
       properties: {
@@ -132,23 +211,58 @@ app.post("/mcp", async (req, res) => {
           });
         }
 
-        const co2 = co2FromTokens(usage.totalTokens, usage.model);
+        // --- PRIMARY: Try Scaleway's actual API first ---
+        let co2Data = await getScalewayActualCO2(
+          usage.startTime,
+          usage.endTime
+        );
+
+        // --- FALLBACK: If API fails or unavailable, use estimation ---
+        if (!co2Data) {
+          co2Data = co2FromTokens(usage.totalTokens, usage.model);
+        }
+
+        // Build detailed response
+        const sourceLabel =
+          co2Data.source === "scaleway_api"
+            ? "**Measured** from Scaleway's Environmental Footprint API"
+            : "**Estimated** based on token count and research energy data";
 
         const text =
           `This conversation used ${usage.totalTokens} tokens ` +
           `(${usage.promptTokens} input, ${usage.completionTokens} output) ` +
           `on model "${usage.model || "unknown"}".\n\n` +
-          `Estimated energy: ${co2.energyWh} Wh\n` +
-          `Estimated CO2e: ${co2.co2Grams} g\n\n` +
-          `Based on actual recorded token transactions, Scaleway's published ` +
-          `Paris-region (PAR-2) grid carbon intensity of ${GRID_INTENSITY_KG_PER_KWH} kgCO2e/kWh, ` +
-          `and a published research estimate for energy-per-token. Scaleway does not ` +
-          `publish a measured per-request energy figure, so this remains an estimate.`;
+          `**CO2e: ${co2Data.co2Grams} g**\n` +
+          `Source: ${sourceLabel}\n\n`;
+
+        // Add details based on source
+        let detailText = "";
+        if (co2Data.source === "scaleway_api") {
+          detailText =
+            `This figure comes directly from Scaleway's measured ` +
+            `Environmental Footprint data for your project between ` +
+            `${usage.startTime} and ${usage.endTime}. ` +
+            `This includes all Scaleway services used during this period ` +
+            `(especially Generative APIs).`;
+        } else {
+          const energyWh = co2Data.energyWh;
+          detailText =
+            `Estimated energy: ${energyWh} Wh\n\n` +
+            `This figure is based on actual recorded token transactions, ` +
+            `Scaleway's published Paris-region (PAR-2) grid carbon intensity ` +
+            `of ${GRID_INTENSITY_KG_PER_KWH} kgCO2e/kWh, and a published ` +
+            `research estimate for energy-per-token (since no provider ` +
+            `publishes measured per-request energy figures).\n\n` +
+            `💡 **Tip**: Set SCALEWAY_API_KEY and SCALEWAY_PROJECT_ID ` +
+            `environment variables to use Scaleway's actual measured CO2 instead.`;
+        }
+
+        const finalText = text + detailText;
 
         return res.json({
           jsonrpc: "2.0",
           id,
-          result: { content: [{ type: "text", text }] },
+          result: { content: [{ type: "text", text: finalText }] },
         });
       }
 
@@ -166,7 +280,7 @@ app.post("/mcp", async (req, res) => {
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "co2-tracker", version: "1.0.0" },
+          serverInfo: { name: "co2-tracker", version: "2.0.0" },
         },
       });
     }
@@ -189,4 +303,13 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => {
   console.log(`CO2 MCP server listening on port ${PORT}`);
+  if (SCALEWAY_API_KEY && SCALEWAY_PROJECT_ID) {
+    console.log(
+      "Scaleway API credentials configured - using actual measured CO2"
+    );
+  } else {
+    console.log(
+      "Scaleway API credentials not configured - using estimate mode"
+    );
+  }
 });
